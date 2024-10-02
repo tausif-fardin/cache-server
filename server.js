@@ -1,3 +1,4 @@
+// server.js
 const express = require("express");
 const axios = require("axios");
 const NodeCache = require("node-cache");
@@ -8,10 +9,16 @@ class CachingProxyServer {
     constructor(port, origin) {
         this.port = port;
         this.origin = origin;
-        this.cache = new NodeCache({ stdTTL: 3600 });
+        this.cache = new NodeCache({ stdTTL: process.env.CACHE_TTL || 3600 }); // Use environment variable for TTL
         this.app = express();
         this.app.use(morgan("combined"));
         this.app.use(this.limiter());
+        this.app.get("/health", this.healthCheck.bind(this)); // Health check endpoint
+    }
+
+    // Health check endpoint
+    healthCheck(req, res) {
+        res.status(200).send("Server is healthy");
     }
 
     async handleRequest(req, res, next) {
@@ -19,27 +26,26 @@ class CachingProxyServer {
             /\/+$/,
             ""
         )}/${req.originalUrl.replace(/^\/+/, "")}`;
-
         console.log(`Forwarding request to: ${url}`); // Log the forwarded URL
-        const cachedResponse = this.cache.get(url);
-
-        if (cachedResponse) {
-            res.setHeader("X-Cache", "HIT");
-            return res.status(200).send(cachedResponse.data);
-        }
 
         try {
+            const cachedResponse = this.cache.get(url);
+            if (cachedResponse) {
+                res.setHeader("X-Cache", "HIT");
+                return res.status(200).send(cachedResponse);
+            }
+
             const response = await axios.get(url);
-            const responseData = response.data; // Simplified data
+            const responseData = response.data;
             this.cache.set(url, responseData);
             res.setHeader("X-Cache", "MISS");
             res.status(response.status).send(responseData);
         } catch (error) {
+            this.handleError(error, res);
             next(error);
         }
     }
 
-    // Rate limiting middleware configuration
     limiter() {
         return rateLimit({
             windowMs: 1 * 60 * 1000, // 1 minute
@@ -47,16 +53,22 @@ class CachingProxyServer {
         });
     }
 
-    // Error handling middleware
-    errorHandler(err, req, res, next) {
-        console.error(err.stack);
-        res.status(500).send("Oops! Something bad happened!");
+    handleError(error, res) {
+        console.error("Error occurred:", error.message);
+        if (error.response) {
+            // Server responded with a status other than 200
+            res.status(error.response.status).send(error.response.data);
+        } else if (error.request) {
+            // Request was made but no response received
+            res.status(504).send("No response from the origin server.");
+        } else {
+            // Something happened in setting up the request
+            res.status(500).send("Oops! Something bad happened!");
+        }
     }
 
     start() {
         this.app.get("*", this.handleRequest.bind(this));
-        // Register the error handling middleware
-        this.app.use(this.errorHandler.bind(this));
         this.app.listen(this.port, () => {
             console.log(`Caching Proxy Server running on port ${this.port}`);
         });
@@ -64,6 +76,7 @@ class CachingProxyServer {
 
     clearCache() {
         this.cache.flushAll();
+        console.log("Cache cleared successfully.");
     }
 }
 
